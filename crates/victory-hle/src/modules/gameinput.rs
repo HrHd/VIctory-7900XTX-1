@@ -1251,6 +1251,26 @@ mod host {
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
+    pub(super) fn key_code(key: &str) -> Option<u8> {
+        Some(match key.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            "Space" => 0x20,
+            "Shift" => 0xA0,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
+#[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
@@ -1281,11 +1301,17 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(from, to, _)| (from..to).contains(&now))
             .map(|&(_, _, vk)| vk)
-            .collect()
-    }
+            .collect();
+        for vk in live::held() {
+            if !down.contains(&vk) {
+                down.push(vk);
+            }
+        }
+        down    }
 
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
@@ -1320,7 +1346,163 @@ mod host {
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "diagnostics")]
+mod live {
+        use std::collections::VecDeque;
+        use std::sync::{LazyLock, Mutex};
+        use std::time::{Duration, Instant};
+
+        /// The gap after each line, so that the same key twice is two presses.
+        const GAP: Duration = Duration::from_millis(150);
+
+        /// One line of the file: the keys held together and for how long.
+        /// `None` for a blank line or a key name `VICTORY_KEYS` does not know.
+        pub(super) fn parse(line: &str) -> Option<(Vec<u8>, Duration)> {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let (keys, ms) = match line.rsplit_once(':') {
+                Some((keys, ms)) => (keys, ms.trim().parse().ok()?),
+                None => (line, 200),
+            };
+            let codes = if keys.trim().eq_ignore_ascii_case("wait") {
+                Vec::new()
+            } else {
+                keys.split('+')
+                    .map(super::host::key_code)
+                    .collect::<Option<Vec<u8>>>()?
+            };
+            Some((codes, Duration::from_millis(ms)))
+        }
+
+        /// Lines waiting their turn, and the one being held.
+        #[derive(Default)]
+        pub(super) struct Queue {
+            waiting: VecDeque<(Vec<u8>, Duration)>,
+            current: Option<(Vec<u8>, Instant)>,
+        }
+
+        impl Queue {
+            pub(super) fn push(&mut self, keys: Vec<u8>, hold: Duration) {
+                self.waiting.push_back((keys, hold));
+                self.waiting.push_back((Vec::new(), GAP));
+            }
+
+            /// The keys held at `now`; a line's time starts when it is first
+            /// asked for, so a title that polls late still sees every press.
+            pub(super) fn held(&mut self, now: Instant) -> Vec<u8> {
+                loop {
+                    if let Some((keys, until)) = &self.current
+                        && now < *until
+                    {
+                        return keys.clone();
+                    }
+                    let Some((keys, hold)) = self.waiting.pop_front() else {
+                        self.current = None;
+                        return Vec::new();
+                    };
+                    self.current = Some((keys, now + hold));
+                }
+            }
+        }
+
+        static QUEUE: LazyLock<Option<Mutex<Queue>>> = LazyLock::new(|| {
+            let path = std::path::PathBuf::from(std::env::var_os("VICTORY_KEYS_LIVE")?);
+            let start = std::fs::metadata(&path).map_or(0, |m| m.len());
+            std::thread::Builder::new()
+                .name("keys-live".into())
+                .spawn(move || follow(&path, start))
+                .ok()?;
+            Some(Mutex::new(Queue::default()))
+        });
+
+        /// Reads what is appended to `path` from byte `offset` on, every
+        /// 100 ms, and queues each complete line.
+        fn follow(path: &std::path::Path, mut offset: u64) {
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(text) = std::fs::read(path) else {
+                    continue;
+                };
+                if (text.len() as u64) < offset {
+                    // The file was emptied: start over from its beginning.
+                    offset = 0;
+                }
+                let fresh = &text[offset as usize..];
+                let Some(end) = fresh.iter().rposition(|&b| b == b'\n') else {
+                    continue;
+                };
+                offset += end as u64 + 1;
+                let Some(queue) = QUEUE.as_ref() else { return };
+                let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
+                for line in String::from_utf8_lossy(&fresh[..end]).lines() {
+                    match parse(line) {
+                        Some((keys, hold)) => {
+                            tracing::info!(line, "VICTORY_KEYS_LIVE: pressed");
+                            queue.push(keys, hold);
+                        }
+                        None if !line.trim().is_empty() => {
+                            tracing::warn!(
+                                line,
+                                "VICTORY_KEYS_LIVE: line not understood (keys[+keys][:ms] or wait:ms)"
+                            );
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+
+        /// The keys the live file holds down now.
+        pub(super) fn held() -> Vec<u8> {
+            let Some(queue) = QUEUE.as_ref() else {
+                return Vec::new();
+            };
+            queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .held(Instant::now())
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn lines_name_keys_holds_and_waits() {
+                let ms = Duration::from_millis;
+                assert_eq!(parse("Enter"), Some((vec![0x0D], ms(200))));
+                assert_eq!(parse("  w+J:1500 "), Some((vec![b'W', b'J'], ms(1500))));
+                assert_eq!(parse("wait:300"), Some((vec![], ms(300))));
+                assert_eq!(parse(""), None);
+                assert_eq!(
+                    parse("Bogus"),
+                    None,
+                    "an unknown key is not pressed as nothing"
+                );
+                assert_eq!(parse("Enter:soon"), None);
+            }
+
+            #[test]
+            fn lines_are_held_one_after_the_other_with_a_gap() {
+                let t = Instant::now();
+                let ms = Duration::from_millis;
+                let mut q = Queue::default();
+                q.push(vec![0x0D], ms(200));
+                q.push(vec![0x0D], ms(200));
+                // The first line's time starts when it is first asked for.
+                assert_eq!(q.held(t + ms(1000)), vec![0x0D]);
+                assert_eq!(q.held(t + ms(1199)), vec![0x0D]);
+                // Then the gap, so the second Enter is a press of its own.
+                assert_eq!(q.held(t + ms(1200)), Vec::<u8>::new());
+                assert_eq!(q.held(t + ms(1350)), vec![0x0D]);
+                assert_eq!(q.held(t + ms(1550)), Vec::<u8>::new());
+                assert_eq!(q.held(t + ms(5000)), Vec::<u8>::new(), "nothing left");
+            }
+        }
+    }
+
 mod tests {
     use std::sync::Arc;
 
